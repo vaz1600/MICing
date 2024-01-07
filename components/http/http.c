@@ -58,6 +58,32 @@ static const char* get_path_from_uri(char *dest, const char *base_path, const ch
 
 const char dirpath[] = "/sdcard/esp_wav";
 
+int create_table_str(char *buf, char *path, char *filename, uint32_t fsize)
+{
+	char duration[64];
+
+	fsize /= 32000; // в секундах
+	int mm = fsize / 60;
+	int ss = fsize % 60;
+
+	sprintf(duration, "%02d:%02d", mm, ss);
+	// надо взять длину файла и псочитать время
+//	<tr><td align="left" style="padding-left:5px">
+//	<a>/123456_123456.wav</a></td>
+//	<td align="right">[00:00:00]</td>
+//	<td align="center">
+//	<a style="text-decoration:none" href="download?rec_0.wav" download="rec_0.wav"><span title="Download">📥</span></a>
+//	<span title="Delete" style="cursor:pointer" onclick="GP_delete(&quot;/esp_wav/rec_0.wav&quot;)">❌</span>
+//	</td></tr>
+
+	int len = sprintf(buf, "<tr><td align='left' style='padding-left:5px'><a>%s</a></td><td align='center'>[%s]</td><td align='center'>\
+			<a style='text-decoration:none' href='download?%s%s' download='%s'><span title='Download'>📥</span></a>\
+			<span title='Delete' style='cursor:pointer' onclick='GP_delete(&quot;/esp_wav/rec_0.wav&quot;)'>❌</span>", filename, duration, path, filename, filename);
+
+	return len;
+}
+
+
 const char index_header[] = "<!DOCTYPE html> \
 <html lang='en' class=''>\
 <head>\
@@ -154,7 +180,165 @@ const char index_tail[] = "</table>\
 </body>\
 </html>";
 
+
 static esp_err_t index_handler(httpd_req_t *req)
+{
+    FILE *fd = NULL;
+    char filepath[64];
+    char filename[64];
+
+    char entrypath[FILE_PATH_MAX];
+    char entrysize[16];
+    const char *entrytype;
+
+	char *chunk = ((struct file_server_data *)req->user_ctx)->scratch;
+	char *chunk_ptr;
+	size_t chunksize;
+	size_t chunksize_tr;
+	long fptr;
+
+	esp_err_t ret;
+
+    ESP_LOGI(TAG, "index.html request");
+
+    fd = fopen("/spiffs/index_l.html", "rb");
+
+	if(!fd)
+	{
+		ESP_LOGE(TAG, "Failed to read index.html");
+		/* Respond with 500 Internal Server Error */
+		httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to read existing file");
+		return ESP_FAIL;
+	}
+
+	httpd_resp_set_type(req, "text/html");
+	httpd_resp_set_hdr(req, "Connection", "close");
+
+
+	do
+	{
+		chunksize = fread(chunk, 1, SCRATCH_BUFSIZE, fd);
+
+		if (chunksize > 0)
+		{
+			// ищем </tbody></table>
+			chunk_ptr = NULL;
+			chunk_ptr = strstr (chunk, "</tbody>");
+
+			// надо отпроавить до этого места
+			// сделать вставку
+			// пересавить указатель файла туда и продложить передачу файла
+			if(chunk_ptr)
+			{
+				chunksize_tr = (size_t )(chunk_ptr - chunk);
+				ESP_LOGI(TAG, "table end found at %u", chunksize_tr);
+
+				ret = httpd_resp_send_chunk(req, chunk, chunksize_tr);
+
+				fptr = ftell(fd);
+				ESP_LOGI(TAG, "found at fptr %ld", fptr);
+
+				fptr = fptr - chunksize;
+				fptr = fptr + chunksize_tr + 8;
+
+				ESP_LOGI(TAG, "fptr shifted to %ld", fptr);
+
+				fseek(fd, fptr, SEEK_SET);
+
+				if (ret != ESP_OK)
+				{
+					fclose(fd);
+					ESP_LOGE(TAG, "File sending failed!");
+					httpd_resp_sendstr_chunk(req, NULL);
+					httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to send file");
+					return ESP_FAIL;
+				}
+
+				// отпроавляем вставочку
+				// смотрим что есть в папочке
+			    struct dirent *entry;
+			    struct stat entry_stat;
+
+			    DIR *dir = opendir(dirpath);
+			    const size_t dirpath_len = strlen(dirpath);
+
+			    /* Retrieve the base path of file storage to construct the full path */
+			    strlcpy(entrypath, dirpath, sizeof(entrypath));
+
+			    if (!dir)
+			    {
+			        ESP_LOGE(TAG, "Failed to stat dir : %s", dirpath);
+				}
+			    else
+			    {
+			    	chunk_ptr = chunk;
+
+					while ((entry = readdir(dir)) != NULL)
+					{
+						entrytype = (entry->d_type == DT_DIR ? "directory" : "file");
+
+						if(entry->d_type == DT_DIR)
+							continue;
+
+						strlcpy(entrypath, dirpath, sizeof(entrypath));
+						strcat(entrypath, "/");
+						strcat(entrypath, entry->d_name);
+
+						if (stat(entrypath, &entry_stat) == -1) {
+							ESP_LOGE(TAG, "Failed to stat %s : %s", entrytype, entry->d_name);
+							continue;
+						}
+						sprintf(entrysize, "%ld", entry_stat.st_size);
+						ESP_LOGI(TAG, "Found %s : %s (%s bytes)", entrytype, entry->d_name, entrysize);
+
+						strlcpy(entrypath, dirpath, sizeof(entrypath));
+						strcat(entrypath, "/");
+
+						chunksize_tr = create_table_str(chunk_ptr, "/sdcard/esp_wav/", entry->d_name, entry_stat.st_size);
+						chunk_ptr += chunksize_tr;
+					}
+
+					closedir(dir);
+					strcat(chunk_ptr, "</tbody>");
+
+					ret = httpd_resp_send_chunk(req, chunk, strlen(chunk));
+					if (ret != ESP_OK)
+					{
+						fclose(fd);
+						ESP_LOGE(TAG, "File sending failed!");
+						httpd_resp_sendstr_chunk(req, NULL);
+						httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to send file");
+						return ESP_FAIL;
+					}
+
+					memset(chunk, 0, SCRATCH_BUFSIZE);
+				}
+
+			}
+			else
+				ret = httpd_resp_send_chunk(req, chunk, chunksize);
+
+			if (ret != ESP_OK)
+			{
+				fclose(fd);
+				ESP_LOGE(TAG, "File sending failed!");
+				httpd_resp_sendstr_chunk(req, NULL);
+				httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to send file");
+				return ESP_FAIL;
+			}
+		}
+	} while (chunksize != 0);
+
+	fclose(fd);
+	ESP_LOGI(TAG, "index.html sending complete");
+
+	/* Send empty chunk to signal HTTP response completion */
+	httpd_resp_send_chunk(req, NULL, 0);
+
+    return ESP_OK;
+}
+
+static esp_err_t index_handler3(httpd_req_t *req)
 {
     char entrypath[FILE_PATH_MAX];
     char entrysize[16];
@@ -368,7 +552,7 @@ static esp_err_t download_get_handler(httpd_req_t *req)
 //  strcpy(filepath, ((struct file_server_data *)req->user_ctx)->base_path);
 //  strcat(filepath, "/");
 //  strcat(filepath, quest+1);
-  strcpy(filepath, "/sdcard/esp_wav/");
+  //strcpy(filepath, "/sdcard/esp_wav/");
   strcat(filepath, quest+1);
 
   //strcpy(filepath, quest+1);
