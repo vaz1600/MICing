@@ -1,0 +1,12 @@
+**/*.o
+**/*bin
+**/*launch
+**/*ioc
+**/*bak
+**/*ld
+.settings/
+build/
+esp_idf_components/
+.cproject
+.mxproject
+.project
